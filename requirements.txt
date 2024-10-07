@@ -1,0 +1,8 @@
+tensorflow[and-cuda]==2.16.1
+opencv-python==4.8.0.76
+numpy==1.24.3
+lxml==4.9.3
+matplotlib==3.7.2
+Pillow==10.0.1
+pandas==2.2.2
+

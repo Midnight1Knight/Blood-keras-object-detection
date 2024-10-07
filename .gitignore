@@ -1,0 +1,6 @@
+.ipynb_checkpoints
+.git
+data/
+.obj_det
+log*
+model*
