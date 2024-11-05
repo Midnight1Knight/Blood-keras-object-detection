@@ -4,3 +4,4 @@ data/
 .obj_det
 log*
 model*
+.*
