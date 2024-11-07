@@ -8,16 +8,9 @@ from tensorflow import keras
 import keras_cv
 from keras_cv import bounding_box
 from keras_cv import visualization
+import numpy as np
 
-import tensorflow as tf
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        print(e)
-tf.config.optimizer.set_jit(False)
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=0'
 
 
 SPLIT_RATIO = 0.2
@@ -25,6 +18,8 @@ BATCH_SIZE = 1
 LEARNING_RATE = 0.001
 EPOCH = 5
 GLOBAL_CLIPNORM = 10.0
+MAX_BOXES = 100
+
 
 def get_classes_from_xml(filename):
     with open(filename) as f:
@@ -37,16 +32,16 @@ def get_classes_from_xml(filename):
             classes.add(name)
         return classes
 
+
 class_ids = set()
-path = 'data/osetr/data/'
+path = 'data/karp/test/'
 for filename in os.listdir(path):
     if filename.endswith('.xml'):
         class_ids.update(get_classes_from_xml(f'{path}{filename}'))
-
 class_mapping = dict(zip(range(len(class_ids)), class_ids))
 
-path_images = "data/osetr/data/"
-path_annot = "data/osetr/data/"
+path_images = 'data/karp/test/'
+path_annot = 'data/karp/test/'
 
 # Get all XML file paths in path_annot and sort them
 xml_files = sorted(
@@ -99,59 +94,105 @@ bbox = []
 classes = []
 for xml_file in tqdm(xml_files):
     image_path, boxes, class_ids = parse_annotation(xml_file)
-    image_paths.append(image_path)
-    bbox.append(boxes)
-    classes.append(class_ids)
 
-bbox = tf.ragged.constant(bbox)
-classes = tf.ragged.constant(classes)
-image_paths = tf.ragged.constant(image_paths)
+    # Pad bounding boxes and classes to have MAX_BOXES slots
+    padded_boxes = np.zeros((MAX_BOXES, 4), dtype=np.float32)
+    padded_classes = np.zeros((MAX_BOXES,), dtype=np.float32)
+
+    # Copy the actual bounding box data into the padded arrays
+    num_boxes = min(len(boxes), MAX_BOXES)
+    padded_boxes[:num_boxes] = boxes[:num_boxes]
+    padded_classes[:num_boxes] = class_ids[:num_boxes]
+
+    image_paths.append(image_path)
+    bbox.append(padded_boxes)
+    classes.append(padded_classes)
+
+image_paths = tf.constant(image_paths)
+bbox = tf.constant(bbox)
+classes = tf.constant(classes)
 
 data = tf.data.Dataset.from_tensor_slices((image_paths, classes, bbox))
 
 num_val = int(len(xml_files) * 0.5)
-
 val_data = data.take(num_val)
 train_data = data.skip(num_val)
 
-bounding_boxes = {
-    'boxes': boxes,
-    'classes': classes
-}
 
+TARGET_SIZE = (640, 640)  # Adjust to the expected YOLO model input size
 
 def load_image(image_path):
     image = tf.io.read_file(image_path)
     image = tf.image.decode_jpeg(image, channels=3)
-    return image
+    # Resize the image to match the model's expected input size
+    image = tf.image.resize(image, TARGET_SIZE)
+    return image / 255.0  # Normalize the image if required by the model
+
+
+def pad_bounding_boxes(bounding_boxes, max_boxes=100):
+    """Pads bounding boxes and classes up to `max_boxes` using `tf.pad`."""
+    num_boxes = tf.shape(bounding_boxes["boxes"])[0]
+    padding_amount = max_boxes - num_boxes
+
+    # Pad or truncate boxes and classes as needed
+    boxes = tf.cond(
+        padding_amount > 0,
+        lambda: tf.pad(bounding_boxes["boxes"], [[0, padding_amount], [0, 0]]),
+        lambda: bounding_boxes["boxes"][:max_boxes]  # Truncate if exceeding max_boxes
+    )
+
+    classes = tf.cond(
+        padding_amount > 0,
+        lambda: tf.pad(bounding_boxes["classes"], [[0, padding_amount]], constant_values=-1),
+        lambda: bounding_boxes["classes"][:max_boxes]  # Truncate if exceeding max_boxes
+    )
+
+    return {"boxes": boxes, "classes": classes}
 
 
 def load_dataset(image_path, classes, bbox):
-    # Read Image
+    # Read and resize image
     image = load_image(image_path)
+
+    # Cast and pad bounding boxes
     bounding_boxes = {
         "classes": tf.cast(classes, dtype=tf.float32),
         "boxes": bbox,
     }
+    bounding_boxes = pad_bounding_boxes(bounding_boxes)
+
+    # Return the image and bounding box dictionary in the required format
     return {"images": tf.cast(image, tf.float32), "bounding_boxes": bounding_boxes}
 
 
-augmenter = keras.Sequential(
-    layers=[
-        keras_cv.layers.RandomFlip(mode="horizontal", bounding_box_format="xyxy"),
-        keras_cv.layers.RandomShear(
-            x_factor=0, y_factor=0, bounding_box_format="xyxy"
-        ),
-        keras_cv.layers.JitteredResize(
-            target_size=(640, 640), scale_factor=(0.9, 1.1), bounding_box_format="xyxy"
-        ),
-    ]
-)
+# augmenter = keras.Sequential(
+#     layers=[
+#         keras_cv.layers.RandomFlip(mode="horizontal", bounding_box_format="xyxy"),
+#         keras_cv.layers.RandomShear(
+#             x_factor=0, y_factor=0, bounding_box_format="xyxy"
+#         ),
+#         keras_cv.layers.JitteredResize(
+#             target_size=(640, 640), scale_factor=(0.9, 1.1), bounding_box_format="xyxy"
+#         ),
+#     ]
+# )
 
 train_ds = train_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
 train_ds = train_ds.shuffle(BATCH_SIZE * 4)
-train_ds = train_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
-train_ds = train_ds.map(augmenter, num_parallel_calls=tf.data.AUTOTUNE)
+train_ds = train_ds.batch(BATCH_SIZE, drop_remainder=True)
+# train_ds = train_ds.map(augmenter, num_parallel_calls=tf.data.AUTOTUNE)
+
+
+# def debug_shapes(data):
+#     images = data["images"]
+#     bounding_boxes = data["bounding_boxes"]
+#     tf.print("Image shape:", tf.shape(images))
+#     tf.print("Bounding boxes shape:", tf.shape(bounding_boxes["boxes"]))
+#     tf.print("Classes shape:", tf.shape(bounding_boxes["classes"]))
+#     return data  # Return the data unchanged so it can continue in the pipeline
+#
+#
+# train_ds = train_ds.map(debug_shapes, num_parallel_calls=tf.data.AUTOTUNE)
 
 resizing = keras_cv.layers.JitteredResize(
     target_size=(640, 640),
@@ -161,8 +202,9 @@ resizing = keras_cv.layers.JitteredResize(
 
 val_ds = val_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
 val_ds = val_ds.shuffle(BATCH_SIZE * 4)
-val_ds = val_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
+val_ds = val_ds.batch(BATCH_SIZE, drop_remainder=True)
 val_ds = val_ds.map(resizing, num_parallel_calls=tf.data.AUTOTUNE)
+
 
 def dict_to_tuple(inputs):
     return inputs["images"], inputs["bounding_boxes"]
@@ -224,6 +266,12 @@ class EvaluateCOCOMetricsCallback(keras.callbacks.Callback):
 
         return logs
 
+for batch in train_ds.take(1):
+    images, bounding_boxes = batch
+    tf.print("Image shape:", tf.shape(images))
+    tf.print("Bounding boxes:", bounding_boxes)
+    # Run a single forward pass
+    yolo(images)
 
 yolo.fit(
     train_ds,
